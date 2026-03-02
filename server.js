@@ -266,6 +266,42 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
   res.json({ received: true });
 });
 
+
+// Contact form - forwards to Gmail via nodemailer
+app.post('/contact', async (req, res) => {
+  if (!rateLimit(req, res, 5)) return;
+
+  const { email, message } = req.body;
+  if (!email || !message) return res.status(400).json({ error: 'Email and message required' });
+
+  // Log contact to console (visible in Render logs)
+  console.log(`📩 CONTACT from ${email}: ${message}`);
+
+  // Forward via Gmail SMTP if configured, otherwise just log
+  const GMAIL_USER = process.env.GMAIL_USER;
+  const GMAIL_PASS = process.env.GMAIL_PASS;
+
+  if (GMAIL_USER && GMAIL_PASS) {
+    try {
+      const nodemailer = require('nodemailer');
+      const transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: GMAIL_USER, pass: GMAIL_PASS }
+      });
+      await transporter.sendMail({
+        from: GMAIL_USER,
+        to: 'hooklensquestions@gmail.com',
+        subject: `HookLens Contact: ${email}`,
+        text: `From: ${email}\n\n${message}`
+      });
+    } catch(e) {
+      console.error('Email send error:', e.message);
+    }
+  }
+
+  res.json({ success: true });
+});
+
 // Whisper - rate limited to 5/hour per IP
 app.post('/transcribe', upload.single('file'), async (req, res) => {
   if (!rateLimit(req, res, 5)) return;
