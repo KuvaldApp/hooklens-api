@@ -23,28 +23,75 @@ const PRICE_IDS = {
 };
 
 const SCAN_LIMITS = {
-  free: 1,
-  starter: 15,
-  pro: 30,
-  agency: 100,
-  yearly: 30
+  free: 1, starter: 15, pro: 30, agency: 100, yearly: 30
 };
 
-const DATA_FILE = '/tmp/hooklens_users.json';
+// ── PERSISTENT STORAGE ──────────────────────────────────
+// Uses a local JSON file but with atomic writes and auto-backup
+// More resilient than /tmp - stored in app directory
+const DATA_FILE = './hooklens_users.json';
+const BACKUP_FILE = './hooklens_users_backup.json';
 
 function loadData() {
-  try {
-    if (fs.existsSync(DATA_FILE)) {
-      return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    }
-  } catch(e) { console.error('loadData error:', e); }
+  // Try main file first, then backup
+  for (const file of [DATA_FILE, BACKUP_FILE]) {
+    try {
+      if (fs.existsSync(file)) {
+        const raw = fs.readFileSync(file, 'utf8');
+        if (raw.trim()) return JSON.parse(raw);
+      }
+    } catch(e) { console.error(`Load error ${file}:`, e.message); }
+  }
   return {};
 }
 
 function saveData(data) {
-  try { fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2)); } catch(e) { console.error('saveData error:', e); }
+  try {
+    const json = JSON.stringify(data, null, 2);
+    // Write to backup first, then main (atomic-ish)
+    fs.writeFileSync(BACKUP_FILE, json);
+    fs.writeFileSync(DATA_FILE, json);
+  } catch(e) { console.error('Save error:', e.message); }
 }
 
+// ── RATE LIMITING ────────────────────────────────────────
+const rateLimits = new Map(); // ip -> { count, resetAt }
+
+function rateLimit(req, res, maxPerHour = 10) {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const windowMs = 60 * 60 * 1000; // 1 hour
+
+  if (!rateLimits.has(ip)) {
+    rateLimits.set(ip, { count: 0, resetAt: now + windowMs });
+  }
+
+  const limit = rateLimits.get(ip);
+
+  // Reset if window expired
+  if (now > limit.resetAt) {
+    limit.count = 0;
+    limit.resetAt = now + windowMs;
+  }
+
+  limit.count++;
+
+  if (limit.count > maxPerHour) {
+    res.status(429).json({ error: 'Too many requests. Please try again later.' });
+    return false;
+  }
+  return true;
+}
+
+// Clean up rate limit map every hour to prevent memory leak
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, limit] of rateLimits.entries()) {
+    if (now > limit.resetAt) rateLimits.delete(ip);
+  }
+}, 60 * 60 * 1000);
+
+// ── ROUTES ───────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
   status: 'HookLens API running',
   whisper: !!OPENAI_KEY,
@@ -52,15 +99,48 @@ app.get('/', (req, res) => res.json({
   stripe: !!STRIPE_SECRET_KEY
 }));
 
-// Email gate - check or create user
-app.post('/gate', async (req, res) => {
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ error: 'Email required' });
+// Email gate
+app.post('/gate', (req, res) => {
+  if (!rateLimit(req, res, 20)) return;
 
+  const { email } = req.body;
+  if (!email || !email.includes('@')) return res.status(400).json({ error: 'Valid email required' });
+
+  const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
   const data = loadData();
+
+  // Check if this IP already has a paid user - if so, don't block
+  const ipHasPaidUser = Object.values(data).some(u => u.ip === ip && u.plan !== 'free');
+
+  // Check if this IP already used a free scan (and has no paid plan)
+  const ipUsedFreeScan = !ipHasPaidUser && Object.values(data).some(u =>
+    u.ip === ip && u.plan === 'free' && u.scansUsed >= u.scansLimit
+  );
+
   if (!data[email]) {
-    data[email] = { email, plan: 'free', scansUsed: 0, scansLimit: 1, createdAt: new Date().toISOString() };
+    // New email - check IP limit for free tier
+    if (ipUsedFreeScan) {
+      return res.status(403).json({
+        error: 'free_scan_used',
+        message: 'A free scan has already been used from this device.',
+        needsUpgrade: true
+      });
+    }
+    data[email] = {
+      email,
+      ip,
+      plan: 'free',
+      scansUsed: 0,
+      scansLimit: 1,
+      createdAt: new Date().toISOString()
+    };
     saveData(data);
+  } else {
+    // Existing email - update IP if they're paid (in case they move networks)
+    if (data[email].plan !== 'free') {
+      data[email].ip = ip;
+      saveData(data);
+    }
   }
 
   const user = data[email];
@@ -75,7 +155,9 @@ app.post('/gate', async (req, res) => {
 });
 
 // Use a scan
-app.post('/use-scan', async (req, res) => {
+app.post('/use-scan', (req, res) => {
+  if (!rateLimit(req, res, 50)) return;
+
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'Email required' });
 
@@ -87,12 +169,20 @@ app.post('/use-scan', async (req, res) => {
   }
 
   data[email].scansUsed += 1;
+  data[email].lastScanAt = new Date().toISOString();
   saveData(data);
-  res.json({ success: true, scansRemaining: data[email].scansLimit - data[email].scansUsed });
+
+  res.json({
+    success: true,
+    scansRemaining: data[email].scansLimit - data[email].scansUsed,
+    plan: data[email].plan
+  });
 });
 
 // Create Stripe checkout
 app.post('/create-checkout', async (req, res) => {
+  if (!rateLimit(req, res, 10)) return;
+
   const { email, plan } = req.body;
   if (!email || !plan) return res.status(400).json({ error: 'Email and plan required' });
   if (!STRIPE_SECRET_KEY) return res.status(500).json({ error: 'Stripe not configured' });
@@ -133,11 +223,8 @@ app.post('/create-checkout', async (req, res) => {
 // Stripe webhook
 app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
   let event;
-  try {
-    event = JSON.parse(req.body);
-  } catch(err) {
-    return res.status(400).json({ error: 'Invalid payload' });
-  }
+  try { event = JSON.parse(req.body); }
+  catch(err) { return res.status(400).json({ error: 'Invalid payload' }); }
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
@@ -146,8 +233,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
 
     if (email) {
       const data = loadData();
+      const existing = data[email] || {};
       data[email] = {
-        ...data[email],
+        ...existing,
         email,
         plan,
         scansUsed: 0,
@@ -156,15 +244,32 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
         stripeSessionId: session.id
       };
       saveData(data);
-      console.log(`Upgraded ${email} to ${plan}`);
+      console.log(`✅ Upgraded ${email} to ${plan} with ${SCAN_LIMITS[plan]} scans`);
+    }
+  }
+
+  // Handle subscription renewal - reset scan count monthly
+  if (event.type === 'invoice.payment_succeeded') {
+    const invoice = event.data.object;
+    const email = invoice.customer_email;
+    if (email) {
+      const data = loadData();
+      if (data[email] && data[email].plan !== 'free') {
+        data[email].scansUsed = 0;
+        data[email].lastRenewalAt = new Date().toISOString();
+        saveData(data);
+        console.log(`🔄 Reset scans for ${email} on renewal`);
+      }
     }
   }
 
   res.json({ received: true });
 });
 
-// Whisper
+// Whisper - rate limited to 5/hour per IP
 app.post('/transcribe', upload.single('file'), async (req, res) => {
+  if (!rateLimit(req, res, 5)) return;
+
   try {
     if (!OPENAI_KEY) return res.status(500).json({ error: 'OpenAI key not configured' });
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
@@ -192,8 +297,10 @@ app.post('/transcribe', upload.single('file'), async (req, res) => {
   }
 });
 
-// Claude proxy
+// Claude proxy - rate limited to 5/hour per IP
 app.post('/analyze', async (req, res) => {
+  if (!rateLimit(req, res, 5)) return;
+
   try {
     if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'Anthropic key not configured' });
 
