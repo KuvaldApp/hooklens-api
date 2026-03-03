@@ -367,3 +367,29 @@ app.post('/analyze', async (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`HookLens API running on port ${PORT}`));
+
+// Admin - view all users (protected by secret key)
+app.get('/admin/users', (req, res) => {
+  const key = req.query.key;
+  const ADMIN_KEY = process.env.ADMIN_KEY || 'hooklens-admin-2024';
+  if (key !== ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
+
+  const data = loadData();
+  const users = Object.values(data).map(u => ({
+    email: u.email,
+    plan: u.plan,
+    scansUsed: u.scansUsed,
+    scansLimit: u.scansLimit,
+    createdAt: u.createdAt,
+    paidAt: u.paidAt || null
+  }));
+
+  const summary = {
+    total: users.length,
+    free: users.filter(u => u.plan === 'free').length,
+    paid: users.filter(u => u.plan !== 'free').length,
+    usedFreeScan: users.filter(u => u.plan === 'free' && u.scansUsed > 0).length
+  };
+
+  res.json({ summary, users });
+});
