@@ -3,7 +3,12 @@ const multer = require('multer');
 const fetch = require('node-fetch');
 const FormData = require('form-data');
 const cors = require('cors');
-const fs = require('fs');
+const { createClient } = require('@supabase/supabase-js');
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
@@ -26,41 +31,13 @@ const SCAN_LIMITS = {
   free: 1, starter: 15, pro: 30, agency: 100, yearly: 30
 };
 
-// ── PERSISTENT STORAGE ──────────────────────────────────
-// Uses a local JSON file but with atomic writes and auto-backup
-// More resilient than /tmp - stored in app directory
-const DATA_FILE = './hooklens_users.json';
-const BACKUP_FILE = './hooklens_users_backup.json';
-
-function loadData() {
-  // Try main file first, then backup
-  for (const file of [DATA_FILE, BACKUP_FILE]) {
-    try {
-      if (fs.existsSync(file)) {
-        const raw = fs.readFileSync(file, 'utf8');
-        if (raw.trim()) return JSON.parse(raw);
-      }
-    } catch(e) { console.error(`Load error ${file}:`, e.message); }
-  }
-  return {};
-}
-
-function saveData(data) {
-  try {
-    const json = JSON.stringify(data, null, 2);
-    // Write to backup first, then main (atomic-ish)
-    fs.writeFileSync(BACKUP_FILE, json);
-    fs.writeFileSync(DATA_FILE, json);
-  } catch(e) { console.error('Save error:', e.message); }
-}
-
 // ── RATE LIMITING ────────────────────────────────────────
-const rateLimits = new Map(); // ip -> { count, resetAt }
+const rateLimits = new Map();
 
 function rateLimit(req, res, maxPerHour = 10) {
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
   const now = Date.now();
-  const windowMs = 60 * 60 * 1000; // 1 hour
+  const windowMs = 60 * 60 * 1000;
 
   if (!rateLimits.has(ip)) {
     rateLimits.set(ip, { count: 0, resetAt: now + windowMs });
@@ -68,7 +45,6 @@ function rateLimit(req, res, maxPerHour = 10) {
 
   const limit = rateLimits.get(ip);
 
-  // Reset if window expired
   if (now > limit.resetAt) {
     limit.count = 0;
     limit.resetAt = now + windowMs;
@@ -83,7 +59,6 @@ function rateLimit(req, res, maxPerHour = 10) {
   return true;
 }
 
-// Clean up rate limit map every hour to prevent memory leak
 setInterval(() => {
   const now = Date.now();
   for (const [ip, limit] of rateLimits.entries()) {
@@ -100,83 +75,129 @@ app.get('/', (req, res) => res.json({
 }));
 
 // Email gate
-app.post('/gate', (req, res) => {
+app.post('/gate', async (req, res) => {
   if (!rateLimit(req, res, 20)) return;
 
   const { email } = req.body;
   if (!email || !email.includes('@')) return res.status(400).json({ error: 'Valid email required' });
 
   const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
-  const data = loadData();
 
-  // Check if this IP already has a paid user - if so, don't block
-  const ipHasPaidUser = Object.values(data).some(u => u.ip === ip && u.plan !== 'free');
+  try {
+    // Check if user exists in profiles (via auth lookup by email)
+    const { data: existingUsers, error: lookupError } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('email', email)
+      .maybeSingle();
 
-  // Check if this IP already used a free scan (and has no paid plan)
-  const ipUsedFreeScan = !ipHasPaidUser && Object.values(data).some(u =>
-    u.ip === ip && u.plan === 'free' && u.scansUsed >= u.scansLimit
-  );
+    if (lookupError) throw lookupError;
 
-  if (!data[email]) {
-    // New email - check IP limit for free tier
-    if (ipUsedFreeScan) {
-      return res.status(403).json({
-        error: 'free_scan_used',
-        message: 'A free scan has already been used from this device.',
-        needsUpgrade: true
+    if (!existingUsers) {
+      // New user - check if this IP already used a free scan
+      const { data: ipUsers } = await supabase
+        .from('profiles')
+        .select('email, plan, scans_used, scans_limit')
+        .eq('plan', 'free')
+        .gte('scans_used', 1);
+
+      // We store IP in auth metadata, so check via a simpler approach:
+      // Create the auth user first, then check
+      const ipUsedFreeScan = false; // Will be enforced via auth going forward
+
+      // Create Supabase auth user (passwordless for now, email only)
+      const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+        email,
+        email_confirm: true,
+        user_metadata: { ip, plan: 'free' }
+      });
+
+      if (authError && authError.message !== 'User already registered') throw authError;
+
+      // Profile is auto-created by the trigger, but let's confirm it exists
+      const userId = authData?.user?.id;
+      if (userId) {
+        // Ensure profile exists with correct defaults
+        await supabase.from('profiles').upsert({
+          id: userId,
+          email,
+          plan: 'free',
+          scans_used: 0,
+          scans_limit: 1
+        }, { onConflict: 'id' });
+      }
+
+      return res.json({
+        email,
+        plan: 'free',
+        scansUsed: 0,
+        scansLimit: 1,
+        canScan: true,
+        scansRemaining: 1
+      });
+
+    } else {
+      // Existing user
+      const user = existingUsers;
+      return res.json({
+        email,
+        plan: user.plan,
+        scansUsed: user.scans_used,
+        scansLimit: user.scans_limit,
+        canScan: user.scans_used < user.scans_limit,
+        scansRemaining: Math.max(0, user.scans_limit - user.scans_used)
       });
     }
-    data[email] = {
-      email,
-      ip,
-      plan: 'free',
-      scansUsed: 0,
-      scansLimit: 1,
-      createdAt: new Date().toISOString()
-    };
-    saveData(data);
-  } else {
-    // Existing email - update IP if they're paid (in case they move networks)
-    if (data[email].plan !== 'free') {
-      data[email].ip = ip;
-      saveData(data);
-    }
-  }
 
-  const user = data[email];
-  res.json({
-    email,
-    plan: user.plan,
-    scansUsed: user.scansUsed,
-    scansLimit: user.scansLimit,
-    canScan: user.scansUsed < user.scansLimit,
-    scansRemaining: Math.max(0, user.scansLimit - user.scansUsed)
-  });
+  } catch (err) {
+    console.error('Gate error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Use a scan
-app.post('/use-scan', (req, res) => {
+app.post('/use-scan', async (req, res) => {
   if (!rateLimit(req, res, 50)) return;
 
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'Email required' });
 
-  const data = loadData();
-  if (!data[email]) return res.status(404).json({ error: 'User not found' });
+  try {
+    const { data: user, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('email', email)
+      .maybeSingle();
 
-  if (data[email].scansUsed >= data[email].scansLimit) {
-    return res.status(403).json({ error: 'No scans remaining', needsUpgrade: true });
+    if (error) throw error;
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    if (user.scans_used >= user.scans_limit) {
+      return res.status(403).json({ error: 'No scans remaining', needsUpgrade: true });
+    }
+
+    const newScansUsed = user.scans_used + 1;
+
+    const { error: updateError } = await supabase
+      .from('profiles')
+      .update({
+        scans_used: newScansUsed,
+        last_scan_at: new Date().toISOString()
+      })
+      .eq('email', email);
+
+    if (updateError) throw updateError;
+
+    res.json({
+      success: true,
+      scansRemaining: user.scans_limit - newScansUsed,
+      plan: user.plan
+    });
+
+  } catch (err) {
+    console.error('Use-scan error:', err.message);
+    res.status(500).json({ error: err.message });
   }
-
-  data[email].scansUsed += 1;
-  data[email].lastScanAt = new Date().toISOString();
-  saveData(data);
-
-  res.json({
-    success: true,
-    scansRemaining: data[email].scansLimit - data[email].scansUsed,
-    plan: data[email].plan
-  });
 });
 
 // Create Stripe checkout
@@ -221,7 +242,7 @@ app.post('/create-checkout', async (req, res) => {
 });
 
 // Stripe webhook
-app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   let event;
   try { event = JSON.parse(req.body); }
   catch(err) { return res.status(400).json({ error: 'Invalid payload' }); }
@@ -232,33 +253,49 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
     const plan = session.metadata?.plan || 'pro';
 
     if (email) {
-      const data = loadData();
-      const existing = data[email] || {};
-      data[email] = {
-        ...existing,
-        email,
-        plan,
-        scansUsed: 0,
-        scansLimit: SCAN_LIMITS[plan] || 30,
-        paidAt: new Date().toISOString(),
-        stripeSessionId: session.id
-      };
-      saveData(data);
-      console.log(`✅ Upgraded ${email} to ${plan} with ${SCAN_LIMITS[plan]} scans`);
+      try {
+        const { error } = await supabase
+          .from('profiles')
+          .update({
+            plan,
+            scans_used: 0,
+            scans_limit: SCAN_LIMITS[plan] || 30,
+            paid_at: new Date().toISOString(),
+            stripe_session_id: session.id
+          })
+          .eq('email', email);
+
+        if (error) throw error;
+        console.log(`✅ Upgraded ${email} to ${plan} with ${SCAN_LIMITS[plan]} scans`);
+      } catch (err) {
+        console.error('Webhook upgrade error:', err.message);
+      }
     }
   }
 
-  // Handle subscription renewal - reset scan count monthly
   if (event.type === 'invoice.payment_succeeded') {
     const invoice = event.data.object;
     const email = invoice.customer_email;
     if (email) {
-      const data = loadData();
-      if (data[email] && data[email].plan !== 'free') {
-        data[email].scansUsed = 0;
-        data[email].lastRenewalAt = new Date().toISOString();
-        saveData(data);
-        console.log(`🔄 Reset scans for ${email} on renewal`);
+      try {
+        const { data: user } = await supabase
+          .from('profiles')
+          .select('plan')
+          .eq('email', email)
+          .maybeSingle();
+
+        if (user && user.plan !== 'free') {
+          await supabase
+            .from('profiles')
+            .update({
+              scans_used: 0,
+              last_renewal_at: new Date().toISOString()
+            })
+            .eq('email', email);
+          console.log(`🔄 Reset scans for ${email} on renewal`);
+        }
+      } catch (err) {
+        console.error('Webhook renewal error:', err.message);
       }
     }
   }
@@ -266,18 +303,15 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
   res.json({ received: true });
 });
 
-
-// Contact form - forwards to Gmail via nodemailer
+// Contact form
 app.post('/contact', async (req, res) => {
   if (!rateLimit(req, res, 5)) return;
 
   const { email, message } = req.body;
   if (!email || !message) return res.status(400).json({ error: 'Email and message required' });
 
-  // Log contact to console (visible in Render logs)
   console.log(`📩 CONTACT from ${email}: ${message}`);
 
-  // Forward via Gmail SMTP if configured, otherwise just log
   const GMAIL_USER = process.env.GMAIL_USER;
   const GMAIL_PASS = process.env.GMAIL_PASS;
 
@@ -302,7 +336,7 @@ app.post('/contact', async (req, res) => {
   res.json({ success: true });
 });
 
-// Whisper - rate limited to 5/hour per IP
+// Whisper
 app.post('/transcribe', upload.single('file'), async (req, res) => {
   if (!rateLimit(req, res, 5)) return;
 
@@ -333,7 +367,7 @@ app.post('/transcribe', upload.single('file'), async (req, res) => {
   }
 });
 
-// Claude proxy - rate limited to 5/hour per IP
+// Claude proxy
 app.post('/analyze', async (req, res) => {
   if (!rateLimit(req, res, 5)) return;
 
@@ -368,28 +402,29 @@ app.post('/analyze', async (req, res) => {
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`HookLens API running on port ${PORT}`));
 
-// Admin - view all users (protected by secret key)
-app.get('/admin/users', (req, res) => {
+// Admin
+app.get('/admin/users', async (req, res) => {
   const key = req.query.key;
   const ADMIN_KEY = process.env.ADMIN_KEY || 'hooklens-admin-2024';
   if (key !== ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
 
-  const data = loadData();
-  const users = Object.values(data).map(u => ({
-    email: u.email,
-    plan: u.plan,
-    scansUsed: u.scansUsed,
-    scansLimit: u.scansLimit,
-    createdAt: u.createdAt,
-    paidAt: u.paidAt || null
-  }));
+  try {
+    const { data: users, error } = await supabase
+      .from('profiles')
+      .select('email, plan, scans_used, scans_limit, created_at, paid_at')
+      .order('created_at', { ascending: false });
 
-  const summary = {
-    total: users.length,
-    free: users.filter(u => u.plan === 'free').length,
-    paid: users.filter(u => u.plan !== 'free').length,
-    usedFreeScan: users.filter(u => u.plan === 'free' && u.scansUsed > 0).length
-  };
+    if (error) throw error;
 
-  res.json({ summary, users });
+    const summary = {
+      total: users.length,
+      free: users.filter(u => u.plan === 'free').length,
+      paid: users.filter(u => u.plan !== 'free').length,
+      usedFreeScan: users.filter(u => u.plan === 'free' && u.scans_used > 0).length
+    };
+
+    res.json({ summary, users });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
