@@ -84,7 +84,6 @@ app.post('/gate', async (req, res) => {
   const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
 
   try {
-    // Check if user exists in profiles (via auth lookup by email)
     const { data: existingUsers, error: lookupError } = await supabase
       .from('profiles')
       .select('*')
@@ -94,18 +93,6 @@ app.post('/gate', async (req, res) => {
     if (lookupError) throw lookupError;
 
     if (!existingUsers) {
-      // New user - check if this IP already used a free scan
-      const { data: ipUsers } = await supabase
-        .from('profiles')
-        .select('email, plan, scans_used, scans_limit')
-        .eq('plan', 'free')
-        .gte('scans_used', 1);
-
-      // We store IP in auth metadata, so check via a simpler approach:
-      // Create the auth user first, then check
-      const ipUsedFreeScan = false; // Will be enforced via auth going forward
-
-      // Create Supabase auth user (passwordless for now, email only)
       const { data: authData, error: authError } = await supabase.auth.admin.createUser({
         email,
         email_confirm: true,
@@ -114,10 +101,8 @@ app.post('/gate', async (req, res) => {
 
       if (authError && authError.message !== 'User already registered') throw authError;
 
-      // Profile is auto-created by the trigger, but let's confirm it exists
       const userId = authData?.user?.id;
       if (userId) {
-        // Ensure profile exists with correct defaults
         await supabase.from('profiles').upsert({
           id: userId,
           email,
@@ -137,7 +122,6 @@ app.post('/gate', async (req, res) => {
       });
 
     } else {
-      // Existing user
       const user = existingUsers;
       return res.json({
         email,
@@ -191,11 +175,41 @@ app.post('/use-scan', async (req, res) => {
     res.json({
       success: true,
       scansRemaining: user.scans_limit - newScansUsed,
+      scansLimit: user.scans_limit,
       plan: user.plan
     });
 
   } catch (err) {
     console.error('Use-scan error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── SAVE SCAN (service role — bypasses RLS) ──────────────
+app.post('/save-scan', async (req, res) => {
+  if (!rateLimit(req, res, 50)) return;
+
+  const { user_id, email, video_name, hook_score, summary, scan_data } = req.body;
+  if (!user_id || !email) return res.status(400).json({ error: 'user_id and email required' });
+
+  try {
+    const { data, error } = await supabase
+      .from('scans')
+      .insert({
+        user_id,
+        email,
+        video_name: video_name || 'Untitled',
+        hook_score: hook_score || null,
+        summary: summary || '',
+        scan_data: scan_data || null
+      });
+
+    if (error) throw error;
+
+    console.log(`💾 Saved scan for ${email} (${user_id})`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Save-scan error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
